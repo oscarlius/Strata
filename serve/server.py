@@ -739,12 +739,22 @@ class ConvCacheLog:
     """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
     which is the log): read on from where it was last read, from the start of the engine's current run."""
+    # #879: these two completed recovery messages follow ConversationCache::clear(), which removes every parked
+    # entry and its retained K/V.  Keep history counters: the clear is not a cache park or restore event.
+    CLEARED = re.compile(
+        r"strata serve: after non-finite logits \(#879\): (?:the restored session replaces the live one; dropped \d+ parked "
+        r"conversations?|dropped the live session, \d+ checkpoints?, \d+ parked conversations? and \d+ idle slots? "
+        r"\(\d+ running slots? not kept after their reply\); reading this prompt from token 0)$")
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
-    READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
+    PRESSURE_SKIP = re.compile(r"conversation cache: skip parking \(physical RAM admission;.*; "
+                               r"evicted \d+, (\d+) still parked\)")
+    MINIMUM_SKIP = re.compile(r"conversation cache: skip parking \(\d+ tokens, below the \d+ minimum; parked=(\d+)\)")
+    READ_MAX = 1 << 20                                  # read in MiB chunks without skipping unread events
 
     def __init__(self):
+        self._lock = threading.Lock()
         self.key, self.pos = None, 0
         self.reset()
 
@@ -754,27 +764,21 @@ class ConvCacheLog:
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
+        # Concurrent metrics requests share this cursor and state; reading the file releases the GIL.
+        with self._lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
         if not path or start is None:
             return dict(self.state)
         if self.key != (path, start):                   # another start of the engine: its cache starts empty
             self.key, self.pos = (path, start), start
             self.reset()
-        try:
-            size = os.path.getsize(path)
-            if size < self.pos:                         # the log was emptied or replaced
-                self.pos = 0
-            if size - self.pos > self.READ_MAX:
-                self.pos = size - self.READ_MAX
-            with open(path, "rb") as f:
-                f.seek(self.pos)
-                data = f.read(size - self.pos)
-        except OSError:
-            return dict(self.state)
-        end = data.rfind(b"\n") + 1                     # whole lines only: the rest is read next time
-        self.pos += end
         now = time.time()
-        for line in data[:end].decode("utf-8", "replace").splitlines():
+        for line in self._lines(path):
             if "conversation cache:" not in line:
+                if self.CLEARED.fullmatch(line):
+                    self.state["parked"] = self.state["bytes"] = 0
                 continue
             m = self.EVENT.search(line)
             if m:
@@ -789,7 +793,52 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+                self.state["bytes"] = None             # retained K/V can remain even when no entries do
+                continue
+            m = self.MINIMUM_SKIP.search(line)
+            if m:
+                self.state["parked"] = int(m.group(1))
+                self.state["bytes"] = None
+                continue                               # this refusal precedes make_room(): no evictions
+            if ("conversation cache: skip parking (" in line or
+                    "conversation cache: allocation failed; skip parking" in line):
+                # make_room() may have evicted entries before a later refusal, without a park/restore summary.
+                # The pressure line gives the remaining count, but its "evicted N" is only that gate's delta,
+                # not the cumulative total (the budget gate may already have evicted others). Don't guess it.
+                m = self.PRESSURE_SKIP.search(line)
+                remaining = int(m.group(1)) if m else None
+                self.state["parked"] = remaining
+                # The pressure gate runs after take_reuse(), so an empty cache there has no retained K/V.
+                self.state["bytes"] = 0 if remaining == 0 else None
+                self.state["evictions"] = None
         return dict(self.state)
+
+    def _lines(self, path):
+        """Read through a captured EOF; only complete lines advance the committed byte cursor."""
+        try:
+            size = os.path.getsize(path)
+            if size < self.pos:                         # the log was emptied or replaced
+                self.pos = 0
+            with open(path, "rb") as f:
+                f.seek(self.pos)
+                pos, parts = self.pos, []
+                while pos < size:
+                    data = f.read(min(self.READ_MAX, size - pos))
+                    if not data:                       # the log may have been truncated since getsize()
+                        break
+                    pos += len(data)
+                    end = data.rfind(b"\n") + 1
+                    if not end:
+                        parts.append(data)
+                        continue
+                    parts.append(data[:end])
+                    complete = b"".join(parts)
+                    self.pos = pos - len(data) + end    # exclude the trailing incomplete line
+                    yield from complete.decode("utf-8", "replace").splitlines()
+                    parts = [data[end:]] if end < len(data) else []
+                # A final partial line remains uncommitted and is read again after the writer completes it.
+        except OSError:
+            return
 
 
 def conversation_slots(engine) -> int | None:
@@ -4753,6 +4802,7 @@ class Service:
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        admission_rejected = False                       # #1994: BGEN refused before any prompt was admitted
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
@@ -5088,6 +5138,14 @@ class Service:
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
+                except GpuBusy:
+                    # A batch engine can exhaust its BGEN retries before it has admitted this request.  Keep an error
+                    # row for the monitor, but do not make it look like a completed generation.  A later continuation
+                    # can have settled native work already, so it keeps the existing accounting.
+                    if not segments and n == 0:
+                        admission_rejected = True
+                        finish = "error"
+                    raise
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -5106,7 +5164,7 @@ class Service:
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
-                            seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            seen = 0 if admission_rejected else prompt_tokens_seen(len(ids), last)
                             self.history.append({
                                 "id": request_id,
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -5127,22 +5185,23 @@ class Service:
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
-                            t = self.totals
-                            t["requests"] += 1
-                            t["prompt_tokens"] += seen
-                            t["reused"] += last.get("reused") or 0
-                            t["output_tokens"] += n
-                            t["prompt_ms"] += last.get("prompt_ms") or 0.0
-                            t["decode_ms"] += last.get("decode_ms") or 0.0
-                            t["drafts_offered"] += last.get("drafts_offered") or 0
-                            t["drafts_accepted"] += last.get("drafts_accepted") or 0
-                            ft0 = st.get("first_token")             # this request's own (#465: one per request)
-                            self.latencies.observe(ft0 - started if ft0 else None, n,
-                                                   (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
-                            fresh = getattr(self.engine, "last", None)
-                            if fresh is not None and fresh is not before:      # the engine's clock for THIS request
-                                timings = request_timings(seen, n, last)
-                                self.last_timings = dict(timings, at=int(time.time())) if timings else None
+                            if not admission_rejected:
+                                t = self.totals
+                                t["requests"] += 1
+                                t["prompt_tokens"] += seen
+                                t["reused"] += last.get("reused") or 0
+                                t["output_tokens"] += n
+                                t["prompt_ms"] += last.get("prompt_ms") or 0.0
+                                t["decode_ms"] += last.get("decode_ms") or 0.0
+                                t["drafts_offered"] += last.get("drafts_offered") or 0
+                                t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                                ft0 = st.get("first_token")         # this request's own (#465: one per request)
+                                self.latencies.observe(ft0 - started if ft0 else None, n,
+                                                       (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
+                                fresh = getattr(self.engine, "last", None)
+                                if fresh is not None and fresh is not before:  # engine clock for THIS request
+                                    timings = request_timings(seen, n, last)
+                                    self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
                             now = time.time()
                             el = now - st.get("started", now)
